@@ -113,18 +113,53 @@ $('#sheet').onclick = e => { if (e.target.id === 'sheet') cerrarHoja(); };
 /* ================= mapas ================= */
 let mapas = [];
 function capaBase(m){
-  // Fondo claro y minimalista (Esri Light Gray) + capa con nombres de calles. No necesita API key.
-  // CARTO Positron (basemaps.cartocdn.com/light_all) ahora devuelve tiles con marca "API KEY REQUIRED" si no se usa clave.
-  // maxNativeZoom: Esri no tiene más detalle desde ese nivel; Leaflet amplía la última imagen disponible
+  // Mapa vectorial (OpenFreeMap, estilo Positron): se dibuja en el navegador, así que se ve nítido
+  // a cualquier zoom y muestra los nombres de jirones y calles de OpenStreetMap. No necesita API key.
+  if (L.maplibreGL && window.maplibregl && maplibregl.supported?.() !== false) {
+    return L.maplibreGL({style:'https://tiles.openfreemap.org/styles/positron',
+      attribution:'<a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>'}).addTo(m);
+  }
+  // Respaldo sin WebGL: imágenes de Esri (se ven borrosas pasado el zoom 16)
   const esri = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/';
-  const opc = {maxZoom:19, maxNativeZoom:16, attribution:'Mapa &copy; Esri, HERE, Garmin, &copy; colaboradores de OpenStreetMap'};
-  L.tileLayer(esri + 'World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', opc).addTo(m);
-  L.tileLayer(esri + 'World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {maxZoom:19, maxNativeZoom:16}).addTo(m);
+  return L.layerGroup([
+    L.tileLayer(esri + 'World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', {maxZoom:19, maxNativeZoom:16, attribution:'Mapa &copy; Esri, HERE, Garmin, &copy; colaboradores de OpenStreetMap'}),
+    L.tileLayer(esri + 'World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {maxZoom:19, maxNativeZoom:16})]).addTo(m);
+}
+// Satélite (Esri World Imagery, sin API key). En Huánuco hay fotos reales solo hasta el zoom 17 (ninguna versión de
+// Esri tiene más). En 18 y 19 Leaflet amplía la foto del 17: se ve suavizada, pero los nombres y pines siguen nítidos.
+const FOTO_MAX_REAL = 17;
+let usarSatelite = false;  // se recuerda al volver a dibujar la pantalla
+// Nombres de calles sobre el satélite: el mismo mapa vectorial pero solo con sus textos (nítidos a cualquier zoom),
+// en blanco con borde oscuro para que se lean sobre la foto. Va en un pane propio, encima de la imagen y sin capturar clics.
+function nombresSatelite(m){
+  if (!(L.maplibreGL && window.maplibregl)) return null;
+  if (!m.getPane('nombres')) { const p = m.createPane('nombres'); p.style.zIndex = 450; p.style.pointerEvents = 'none'; }
+  const capa = L.maplibreGL({style:'https://tiles.openfreemap.org/styles/positron', pane:'nombres', interactive:false});
+  capa.on('add', () => capa.getMaplibreMap().once('style.load', e => {
+    const gl = e.target;
+    gl.getStyle().layers.forEach(ly => {
+      if (ly.type !== 'symbol') return gl.removeLayer(ly.id);  // fuera fondo, calles y edificios: solo textos
+      if (!ly.layout || !ly.layout['text-field']) return;
+      gl.setPaintProperty(ly.id, 'text-color', '#ffffff');
+      gl.setPaintProperty(ly.id, 'text-halo-color', 'rgba(0,0,0,0.8)');
+      gl.setPaintProperty(ly.id, 'text-halo-width', 1.6);
+    });
+  }));
+  return capa;
+}
+function selectorSatelite(m, mapa){
+  const foto = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    {maxZoom:19, maxNativeZoom:FOTO_MAX_REAL, attribution:'Imágenes &copy; Esri, Maxar, Earthstar Geographics'});
+  const nombres = nombresSatelite(m);
+  const satelite = nombres ? L.layerGroup([foto, nombres]) : foto;
+  L.control.layers({'Mapa':mapa, 'Satélite':satelite}, null, {position:'topright', collapsed:false}).addTo(m);
+  if (usarSatelite) { m.removeLayer(mapa); satelite.addTo(m); }
+  m.on('baselayerchange', e => { usarSatelite = e.layer === satelite; });
 }
 const pin = color => L.divIcon({className:'', html:`<div class="pin" style="background:${color}"></div>`, iconSize:[26,26], iconAnchor:[13,26], popupAnchor:[0,-24]});
 function nuevoMapa(el, centro, zoom, opciones = {}){
-  const m = L.map(el, opciones).setView(centro, zoom);
-  capaBase(m); mapas.push(m);
+  const m = L.map(el, {maxZoom:19, ...opciones}).setView(centro, zoom);
+  selectorSatelite(m, capaBase(m)); mapas.push(m);
   setTimeout(() => { if (mapas.includes(m)) m.invalidateSize({animate:false}); }, 80);
   return m;
 }
