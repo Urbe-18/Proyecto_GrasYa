@@ -60,23 +60,8 @@ function datosEjemplo(){
       servicios:['Vestuarios','Duchas','Estacionamiento','Iluminación nocturna'],
       canchas:[{id:'C12', nombre:'Cancha Sintética', tipo:'Fútbol 7', precio:55, recargo:15}]}),
   ];
-  const tmp = {locales};
-  const r = (localId, canchaId, d, hora, cliente, estado, op = '') => {
-    const l = locales.find(x => x.id === localId), c = l.canchas.find(x => x.id === canchaId);
-    const precio = precioHora(l, c, hora);
-    return {id:uid(), localId, canchaId, fecha:hoyISO(d), hora, cliente, telefono:'9' + Math.floor(10000000 + Math.random()*89999999),
-      operacion:op || String(Math.floor(10000000 + Math.random()*89999999)), precio, adelanto:calcAdelanto(l, precio), estado, origen:'plataforma', nota:'', creado:hoyISO(d < 0 ? d : 0)};
-  };
-  const b = (localId, canchaId, d, hora, nota) => ({id:uid(), localId, canchaId, fecha:hoyISO(d), hora, cliente:'', telefono:'', precio:0, adelanto:0, estado:'bloqueada', origen:'dueno', nota});
-  const reservas = [
-    r('L1','C1',0,20,'Delegado Promo 2015','confirmada'), r('L1','C1',0,21,'Los Amigos FC','confirmada'),
-    b('L1','C2',0,20,'Separada por WhatsApp'), r('L1','C1',0,22,'Equipo Oficina','pendiente'),
-    r('L1','C2',1,20,'Tíos del Barrio','confirmada'), b('L2','C3',0,20,'Separada por WhatsApp'),
-    r('L2','C3',0,21,'Real Olivos','confirmada'), r('L3','C4',0,19,'Los Pibes','confirmada'),
-    b('L3','C5',0,20,'Mantenimiento'), r('L3','C6',0,20,'Ingenieros UNI','pendiente'),
-    r('L3','C4',-1,20,'Familia Torres','confirmada'), r('L1','C1',-1,20,'Delegado Promo 2015','confirmada'),
-  ];
-  return {locales, reservas, ajustes:{yape:'999 000 111', titular:'GrassYa', comision:3, piloto:false}};
+  // Las reservas ya no son de ejemplo: viven en Firestore y se comparten entre todos
+  return {locales, reservas:[], ajustes:{yape:'999 000 111', titular:'GrassYa', comision:3, piloto:false}};
 }
 
 /* ================= reglas de negocio ================= */
@@ -89,14 +74,80 @@ function horaPasada(fecha, h){ const ahora = new Date(); const hoy = iso(ahora);
 
 let db;
 try { db = JSON.parse(localStorage.getItem(KEY)) || datosEjemplo(); } catch { db = datosEjemplo(); }
+db.reservas = [];  // las reservas llegan de Firestore (escucharReservas); las viejas de este navegador se ignoran
 function guardar(){
-  try { localStorage.setItem(KEY, JSON.stringify(db)); return true; }
+  // En este navegador solo se guardan locales, fotos y ajustes. Las reservas van a Firestore.
+  try { localStorage.setItem(KEY, JSON.stringify({...db, reservas:[]})); return true; }
   catch { toast('No hay espacio para guardar. Elimina algunas fotos e intenta de nuevo.'); return false; }
 }
 const local = id => db.locales.find(l => l.id === id);
 const cancha = (l, id) => l.canchas.find(c => c.id === id) || {id, nombre:'(cancha eliminada)', tipo:'', precio:0, recargo:0};
-const ocupacion = (lid, cid, f, h) => db.reservas.find(r => r.localId === lid && r.canchaId === cid && r.fecha === f && r.hora === h && ['pendiente','confirmada','bloqueada'].includes(r.estado));
+const ocupacion = (lid, cid, f, h) => db.reservas.find(r => r.localId === lid && r.canchaId === cid && r.fecha === f && r.hora === h && !['rechazada','cancelada'].includes(r.estado));
 const tasaComision = () => db.ajustes.piloto ? 0 : (db.ajustes.comision || 0) / 100;
+
+/* ================= reservas compartidas (Firebase) ================= */
+// Cada reserva es un documento de la colección "reservas" con ID cancha_fecha_hora (ej. C1_2026-11-09_20).
+// Dos reservas de la misma cancha, día y hora caen en el MISMO ID: la transacción solo deja crear la primera.
+let miUid = null, conexion = 'conectando';  // conectando | ok | error
+const idReserva = (canchaId, fecha, hora) => `${canchaId}_${fecha}_${hora}`;
+const refReserva = id => firebase.firestore().collection('reservas').doc(id);
+const OCUPADA = new Error('ocupada');
+function conectarReservas(){
+  if (typeof firebase === 'undefined' || !firebase.apps.length) { conexion = 'error'; render(true); return; }
+  // Login anónimo: da un uid estable por navegador. Recién con el uid se leen y escriben reservas.
+  firebase.auth().signInAnonymously()
+    .then(cred => { miUid = cred.user.uid; escucharReservas(); })
+    .catch(e => { console.error(e); conexion = 'error'; render(true); });
+}
+function escucharReservas(){
+  // Tiempo real: cada vez que alguien reserva, cancela o bloquea, Firestore avisa a todos los navegadores abiertos
+  firebase.firestore().collection('reservas').onSnapshot(snap => {
+    db.reservas = snap.docs.map(d => ({...d.data(), id:d.id}));
+    const primera = conexion !== 'ok'; conexion = 'ok';
+    refrescarEnVivo(primera);
+  }, e => { console.error(e); conexion = 'error'; render(true); });
+}
+function listo(){
+  if (conexion === 'ok') return true;
+  toast(conexion === 'error' ? 'Sin conexión con el servidor de reservas. Recarga la página.' : 'Conectando con el servidor de reservas… intenta en unos segundos.');
+  return false;
+}
+function crearReserva(datos){
+  const ref = refReserva(idReserva(datos.canchaId, datos.fecha, datos.hora));
+  return firebase.firestore().runTransaction(async tx => {
+    if ((await tx.get(ref)).exists) throw OCUPADA;
+    tx.set(ref, {...datos, userId:miUid, createdAt:firebase.firestore.FieldValue.serverTimestamp()});
+  });
+}
+async function cancelarReserva(id){
+  const r = db.reservas.find(x => x.id === id);
+  if (!r) return false;
+  if (r.userId !== miUid) { toast('Solo quien hizo la reserva puede cancelarla'); return false; }
+  try { await refReserva(id).delete(); return true; } catch (e) { errorReserva(e); return false; }
+}
+function errorReserva(e){
+  if (e === OCUPADA) return toast('Esa cancha ya está reservada a esa hora');
+  console.error(e);
+  if (e.code === 'permission-denied') return toast('No tienes permiso: solo quien hizo la reserva puede modificarla o cancelarla');
+  if (e.code === 'unavailable') return toast('Sin conexión. Revisa tu internet e intenta de nuevo.');
+  toast('No se pudo guardar la reserva. Intenta de nuevo.');
+}
+// Al llegar cambios de otros usuarios se redibuja, salvo donde borraría lo que el usuario está escribiendo
+function refrescarEnVivo(primera){
+  if (primera) return render(true);
+  if (!$('#sheet').hidden) return;
+  const ajena = (c, h) => { const oc = ocupacion(st.localSel, c, st.fecha, h); return oc && oc.userId !== miUid; };
+  if (st.vista === 'cliente') {
+    if ((st.paso === 2 || st.paso === 3) && st.slotSel && ajena(st.slotSel.c, st.slotSel.h)) {
+      st.paso = 2; st.slotSel = null; render(true); toast('Esa hora acaba de ocuparse. Elige otra.'); return;
+    }
+    if (st.paso === 3 || st.paso === 4) return;
+    if (st.paso === 1 && document.querySelector('.leaflet-popup')) return;  // no cerrar el popup abierto
+  }
+  if (st.vista === 'dueno' && st.dueno.sub !== 'calendario') return;
+  if (st.vista === 'admin' && st.admin.sub === 'ajustes') return;
+  render(true);
+}
 
 /* ================= toast y hoja inferior ================= */
 let toastT, undoFn;
@@ -271,18 +322,23 @@ $('#nav').onclick = e => {
   render();
 };
 $('#reset').onclick = () => {
-  abrirHoja(`<h3>¿Restaurar datos de ejemplo?</h3><p>Se borrarán los locales, fotos y reservas que hayas creado en este navegador.</p>
+  abrirHoja(`<h3>¿Restaurar datos de ejemplo?</h3><p>Se borrarán los locales y fotos que hayas creado en este navegador. Las reservas compartidas no se tocan.</p>
     <div class="row"><button class="btn red" style="flex:1" onclick="restaurar()">Sí, restaurar</button><button class="btn sec" onclick="cerrarHoja()">Cancelar</button></div>`);
 };
-function restaurar(){ db = datosEjemplo(); guardar(); cerrarHoja(); st.paso = 1; st.dueno.local = 'L1'; st.dueno.sub = 'calendario'; st.borrador = null; st.admin.sub = 'resumen'; render(); toast('Datos de ejemplo restaurados'); }
+function restaurar(){ db = {...datosEjemplo(), reservas:db.reservas}; guardar(); cerrarHoja(); st.paso = 1; st.dueno.local = 'L1'; st.dueno.sub = 'calendario'; st.borrador = null; st.admin.sub = 'resumen'; render(); toast('Datos de ejemplo restaurados'); }
 
 function render(mantenerScroll){
   const y = window.scrollY;
   const app = $('#app');
-  if (st.vista === 'cliente') app.innerHTML = vistaCliente();
-  if (st.vista === 'dueno') app.innerHTML = vistaDueno();
-  if (st.vista === 'admin') app.innerHTML = vistaAdmin();
+  // Al refrescar (p. ej. llega una reserva nueva) el mapa vuelve a donde estaba el usuario
+  const vistasMapa = mantenerScroll ? mapas.map(m => ({tipo:m.getContainer().dataset.mapa, centro:m.getCenter(), zoom:m.getZoom()})) : [];
+  const aviso = conexion === 'error' ? '<div class="alerta">No hay conexión con el servidor de reservas: la disponibilidad puede no estar al día y no se puede reservar. Revisa tu internet y recarga la página.</div>'
+    : conexion === 'conectando' ? '<div class="note" style="margin-bottom:12px">Conectando con el servidor de reservas…</div>' : '';
+  if (st.vista === 'cliente') app.innerHTML = aviso + vistaCliente();
+  if (st.vista === 'dueno') app.innerHTML = aviso + vistaDueno();
+  if (st.vista === 'admin') app.innerHTML = aviso + vistaAdmin();
   montarMapas();
+  mapas.forEach((m, i) => { const v = vistasMapa[i]; if (v && v.tipo === m.getContainer().dataset.mapa) m.setView(v.centro, v.zoom, {animate:false}); });
   window.scrollTo({top: mantenerScroll ? y : 0});
 }
 
@@ -330,8 +386,26 @@ function vistaCliente(){
     </div>
     ${st.mapaDatos.length ? `<div class="card" style="padding:10px"><div class="mapa" data-mapa="lista"></div>
       <div class="legend" style="padding:0 4px"><span><i style="background:#1f8a4c;border-radius:50%"></i>Con canchas libres</span><span><i style="background:#9aa59c;border-radius:50%"></i>Sin canchas libres a esa hora</span></div></div>` : ''}
+    ${misReservas()}
     <div class="grid">${tarjetas || '<p class="muted">No hay locales publicados en esta búsqueda.</p>'}</div>`;
 }
+function misReservas(){
+  const mias = db.reservas.filter(r => r.userId === miUid && r.origen === 'plataforma' && r.fecha >= hoyISO())
+    .sort((a, b) => (a.fecha + pad(a.hora)).localeCompare(b.fecha + pad(b.hora)));
+  if (!mias.length) return '';
+  return `<div class="card"><h3>Mis reservas</h3>${mias.map(r => { const l = local(r.localId); return `<div class="list-item">
+    <div><b>${esc(l ? l.nombre : 'Local')}</b> · ${esc(l ? cancha(l, r.canchaId).nombre : '')}
+      <div class="muted small">${fechaTxt(r.fecha)} · ${horaTxt(r.hora)}</div></div>
+    <div class="row" style="align-items:center">${estadoReserva(r.estado) || ''}<button class="btn sm sec" onclick="pedirCancelar('${esc(r.id)}')">Cancelar</button></div></div>`; }).join('')}</div>`;
+}
+function pedirCancelar(id){
+  const r = db.reservas.find(x => x.id === id), l = r && local(r.localId);
+  if (!r) return;
+  abrirHoja(`<h3>¿Cancelar tu reserva?</h3><p>${esc(l ? l.nombre : '')} · ${fechaTxt(r.fecha)} a las ${horaTxt(r.hora)}</p>
+    ${l ? `<p class="note">Política del local: ${esc(l.politica)}</p>` : ''}
+    <div class="row"><button class="btn red" style="flex:1" onclick="confirmarCancelar('${esc(id)}')">Sí, cancelar</button><button class="btn sec" onclick="cerrarHoja()">Volver</button></div>`);
+}
+async function confirmarCancelar(id){ cerrarHoja(); if (await cancelarReserva(id)) toast('Reserva cancelada; la hora quedó libre'); }
 function verLocal(id){ st.localSel = id; st.slotSel = null; st.paso = 2; st.vista = 'cliente'; render(); }
 
 function clienteLocal(){
@@ -399,20 +473,27 @@ function clientePago(){
         </div>
         <label style="margin-top:10px">Número de operación<input id="pOp" inputmode="numeric" maxlength="30" placeholder="Lo ves en el comprobante de tu app"></label>
         <p class="note">Política del local: ${esc(l.politica)}</p>
-        <button class="btn full" onclick="enviarPago()">Ya pagué, enviar reserva</button>
+        <button class="btn full" id="btnPagar" onclick="enviarPago()">Ya pagué, enviar reserva</button>
       </div>
     </div>`;
 }
-function enviarPago(){
+async function enviarPago(){
   const nom = $('#pNom').value.trim(), tel = $('#pTel').value.trim(), op = $('#pOp').value.trim();
   if (!nom || !/^[\d\s+]{9,15}$/.test(tel)) { toast('Completa tu nombre y un celular válido'); return; }
   if (op.length < 4) { toast('Escribe el número de operación de tu Yape o Plin'); return; }
+  if (!listo()) return;
   const l = local(st.localSel), c = cancha(l, st.slotSel.c), h = st.slotSel.h;
-  if (ocupacion(l.id, c.id, st.fecha, h)) { toast('Esa hora acaba de ocuparse. Elige otra.'); st.paso = 2; st.slotSel = null; render(); return; }
-  const precio = precioHora(l, c, h);
-  db.reservas.push({id:uid(), localId:l.id, canchaId:c.id, fecha:st.fecha, hora:h, cliente:nom, telefono:tel, operacion:op,
-    precio, adelanto:calcAdelanto(l, precio), estado:'pendiente', origen:'plataforma', nota:'', creado:hoyISO()});
-  if (guardar()) { st.paso = 4; render(); }
+  const precio = precioHora(l, c, h), btn = $('#btnPagar');
+  btn.disabled = true; btn.textContent = 'Enviando…';
+  try {
+    await crearReserva({localId:l.id, canchaId:c.id, fecha:st.fecha, hora:h, cliente:nom, telefono:tel, operacion:op,
+      precio, adelanto:calcAdelanto(l, precio), estado:'pendiente', origen:'plataforma', nota:'', creado:hoyISO()});
+    st.paso = 4; render();
+  } catch (e) {
+    errorReserva(e);
+    if (e === OCUPADA) { st.paso = 2; st.slotSel = null; render(); }
+    else { btn.disabled = false; btn.textContent = 'Ya pagué, enviar reserva'; }
+  }
 }
 function clienteListo(){
   const l = local(st.localSel), c = cancha(l, st.slotSel.c);
@@ -500,7 +581,8 @@ function tocarSlot(cid, h){
     <label>Motivo (opcional)<input id="blMot" maxlength="80" placeholder="Ej. Separada por WhatsApp – Juan"></label>
     <div class="row" style="margin-top:14px"><button class="btn" style="flex:1" onclick="bloquear('${cid}',${h})">Bloquear esta hora</button><button class="btn sec" onclick="cerrarHoja()">Cancelar</button></div>`);
   if (oc.estado === 'bloqueada') return abrirHoja(`${titulo}<p>Bloqueada: ${esc(oc.nota || 'sin motivo')}</p>
-    <div class="row"><button class="btn" style="flex:1" onclick="liberar('${oc.id}')">Liberar hora</button><button class="btn sec" onclick="cerrarHoja()">Cerrar</button></div>`);
+    ${oc.userId === miUid ? '' : '<p class="muted small">La bloqueó otro dispositivo: solo se puede liberar desde allí.</p>'}
+    <div class="row">${oc.userId === miUid ? `<button class="btn" style="flex:1" onclick="liberar('${esc(oc.id)}')">Liberar hora</button>` : ''}<button class="btn sec" onclick="cerrarHoja()">Cerrar</button></div>`);
   abrirHoja(`${titulo}<div class="summary">
       <div><span>Cliente</span><span>${esc(oc.cliente)}</span></div>
       <div><span>Celular</span><span>${esc(oc.telefono)}</span></div>
@@ -509,16 +591,21 @@ function tocarSlot(cid, h){
       <div><span>Saldo a cobrar en cancha</span><b>${soles(oc.precio - oc.adelanto)}</b></div></div>
     <button class="btn sec full" style="margin-top:12px" onclick="cerrarHoja()">Cerrar</button>`);
 }
-function bloquear(cid, h){
-  const r = {id:uid(), localId:st.dueno.local, canchaId:cid, fecha:st.dueno.fecha, hora:h, cliente:'', telefono:'', precio:0, adelanto:0,
-    estado:'bloqueada', origen:'dueno', nota:$('#blMot').value.trim() || 'Separada por WhatsApp'};
-  db.reservas.push(r); guardar(); cerrarHoja(); render(true);
-  toast(`${horaTxt(h)} bloqueada`, () => { db.reservas = db.reservas.filter(x => x.id !== r.id); guardar(); render(true); });
+async function bloquear(cid, h){
+  const nota = $('#blMot').value.trim() || 'Separada por WhatsApp';
+  cerrarHoja();
+  if (!listo()) return;
+  const datos = {localId:st.dueno.local, canchaId:cid, fecha:st.dueno.fecha, hora:h, cliente:'', telefono:'', precio:0, adelanto:0,
+    estado:'bloqueada', origen:'dueno', nota};
+  try { await crearReserva(datos); } catch (e) { return errorReserva(e); }
+  toast(`${horaTxt(h)} bloqueada`, () => cancelarReserva(idReserva(cid, datos.fecha, h)));
 }
-function liberar(id){
+async function liberar(id){
   const r = db.reservas.find(x => x.id === id);
-  db.reservas = db.reservas.filter(x => x.id !== id); guardar(); cerrarHoja(); render(true);
-  toast(`${horaTxt(r.hora)} liberada`, () => { db.reservas.push(r); guardar(); render(true); });
+  cerrarHoja();
+  if (!r || !await cancelarReserva(id)) return;
+  const {id:_, userId, createdAt, ...datos} = r;
+  toast(`${horaTxt(r.hora)} liberada`, () => crearReserva(datos).catch(errorReserva));
 }
 
 /* ---------- editor de local (nuevo o existente) ---------- */
@@ -707,10 +794,16 @@ function resumenAdmin(){
         <div class="row"><button class="btn sm sec" onclick="verFicha('${l.id}')">Revisar todo</button><button class="btn sm" onclick="decidirLocal('${l.id}','aprobado')">Aprobar</button></div>
       </div>`).join('') || '<p class="muted" style="margin:0">No hay locales esperando aprobación.</p>'}</div>`;
 }
-function decidirPago(id, estado){
-  const r = db.reservas.find(x => x.id === id), prev = r.estado;
-  r.estado = estado; guardar(); render(true);
-  toast(estado === 'confirmada' ? `Pago de ${r.cliente} confirmado` : 'Reserva rechazada; la hora quedó libre', () => { r.estado = prev; guardar(); render(true); });
+async function decidirPago(id, estado){
+  // Confirmar = cambiar el estado; rechazar = borrar el documento para que la hora quede libre.
+  // OJO: las reglas actuales de Firestore no permiten cambiar ni borrar reservas ajenas (falta un rol de administrador).
+  const r = db.reservas.find(x => x.id === id);
+  if (!r || !listo()) return;
+  try {
+    if (estado === 'confirmada') await refReserva(id).update({estado});
+    else await refReserva(id).delete();
+  } catch (e) { return errorReserva(e); }
+  toast(estado === 'confirmada' ? `Pago de ${r.cliente} confirmado` : 'Reserva rechazada; la hora quedó libre');
 }
 function decidirLocal(id, estado, motivo = ''){
   const l = local(id), prev = {estado:l.estado, motivo:l.motivo};
@@ -797,3 +890,4 @@ function guardarAjustes(){
 }
 
 render();
+conectarReservas();
